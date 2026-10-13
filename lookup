@@ -1,0 +1,788 @@
+#! /bin/bash
+
+# Program: lookup.sh
+# Version: 1.7
+#    Date: 3-Mar-2025
+#  Author: gerry.walterscheid@gmail.com
+
+# Description:
+#
+# Provide Google-like searches of daily work notes.
+
+# ------- --------- --------- --------- --------- --------- --------- --------- --------- ---------
+
+# Initialize global variables.
+
+script="lookup"
+path="$HOME/Documents/DailyLog"
+basePath="`echo $path | awk -F "/" '{ print "/"$2"/"$3 }'`"
+
+block=6                         # Search window, ie. lines where multiple hits are ignored.
+content=4                       # Number of content lines to display for each hit.
+depth=100                       # Limit number of initial hits for faster results.
+matches=5                       # Number of matches to display. (updated within Results function)
+
+rows=$(tput lines)                                 # Terminal session screen height.
+cols=$(tput cols)                                  # Terminal session screen width.
+matches=$(( (rows - 8 ) / (7 + content) ))         # Calculate how many results will fit.
+
+BOLD="$(tput bold)"             # Tagline
+GREEN="$(tput setaf 2)"         # Content File path.
+YELLOW="$(tput setaf 3)"        # Current page indicator color.
+BLUE="$(tput setaf 4)"          # Content Title.
+WHITE="$(tput setaf 7)"		# Script tagline, stats, content, and page numbers.
+NORM="$(tput setaf 9)"          # Reset to default color.
+
+start=0				# CPU Start Time
+finish=0			# CPU Finish/Stop Time
+delta=0				# CPU Time for search.
+
+files=0				# Total files found containing match.
+results=0			# Total number of matches.
+
+valid_keys=""			# Search keys which have hits.
+
+declare -a stop_words=( a able about across after all almost also am among an and any are as at be \
+                        because been but by can cannot could did do does either else ever every \
+                        for from get got had has have he her hers him his how however i if in into \
+                        is it its just least let like likely may me might most must my neither no \
+                        nor not of off often on only or other our own rather said say says she \
+                        should since so some than that the their them then there these they this \
+                        those to too us wants was we were what when where which while who whom why \
+                        will with would yet you your )
+
+tput civis                      # Make the cursor invisible.
+cd "$path"			# Run all commands from archive path.
+
+# ------- --------- --------- --------- --------- --------- --------- --------- --------- ---------
+
+usage_error ()
+{
+    echo
+    echo "Quickly locate a process, notes, or event in the past."
+    echo "usage: $script [item1] [item2] [item3] ..."
+    echo 
+    normalExit
+}
+
+# ------- --------- --------- --------- --------- --------- --------- --------- --------- ---------
+
+stop_word ()
+
+# Remove stop words, ie common words, to eliminate excessive hits.
+
+{
+    my_key=$1
+
+    if [ ${#my_key} == 1 ]; then
+        return 0
+    fi
+
+    for word in ${stop_words[@]}; do
+        if [ "$my_key" == "$word" ]; then
+        return 0 
+        fi
+    done
+
+    return 1
+}
+
+# ------- --------- --------- --------- --------- --------- --------- --------- --------- ---------
+
+asterisk ()
+
+# Creates new grep search string when asterisks were added to the key, to search for parts of a word 
+# instead of whole words.
+
+{
+    my_key=$1
+
+    if [[ $1 =~ "*". && $1 =~ ."*" ]]; then 
+        echo ${my_key} | sed 's/*//g'
+    
+    elif [[ $1 =~ "*". ]]; then 
+        echo ${my_key#?}"\b"
+
+    elif [[ $1 =~ ."*" ]]; then 
+        echo "\b"${my_key%?}
+
+    else
+        echo "\b"${my_key}"\b"
+    fi
+}
+
+# =================================================================================================
+#  Search algorithm and supporting functions.
+# =================================================================================================
+
+Search ()
+
+# Search archive path for matching records containing search keys.
+
+{
+    echo
+    echo -n "Searching..."
+
+    start=$(date +"%s%N")
+
+    # Find a matching key.
+
+    files=""
+    key="$1"
+
+    while (( $# > 0 )); do
+        # Throw out any keys which are stop words, to reduce false hits.
+        if stop_word $key; then
+            shift
+            key="$1"
+            continue
+        fi
+
+        # Abort for inital negate keys, since there is nothing to filter yet.
+        if [[ $key == -* ]]; then
+            echo
+            echo "Your search scope was too broad."
+            echo
+            echo "Adjust the position of negative keys so that"
+            echo "there is content from prior key search available"
+            echo "to filter results."
+            echo
+            normalExit
+        fi
+         
+        # Check for asterisks in key, and adjust grep search string accordingly.
+        search=$(asterisk $key)
+
+        # Create list of files with hits to generate quicker results.
+        sum=0
+    
+        files="`grep -ic "$search" dailylog-*.txt | sort -r | \
+            while IFS=":" read filename index; do
+                (( sum += index ))
+                if [ $index -gt 0 ]; then
+                    echo $filename
+                fi
+
+                if [ $sum -gt $depth ]; then            # Limit the number of hits.
+                    break
+                fi
+            done`"
+
+        # If there were any hits, exit initial scan.
+        if [[ ${#files} -gt 0 ]]; then
+            break
+        fi
+
+        # Get next search key.
+        shift
+        key="$1"
+
+        >&2 echo -n "."					# show progress during search.
+    done
+
+    # No match was found with any key. Update user and exit.
+    if (( ${#files} == 0 )); then
+        echo
+        echo "Your search did not match any keys."
+        echo
+        echo "Suggestions:"
+        echo
+        echo "- Make sure all words are spelled correctly."
+        echo "- Search parts of words by adding an asterisk."
+        echo "- Try different keywords."
+        echo "- Try more general keywords."
+        echo
+        normalExit
+    fi
+
+    # Process each key, saving each search result to pass1.dat.
+    count=0
+
+    # Re-init file used to collect key hit data.
+    touch pass1.dat 
+    rm pass1.dat 
+
+    while (( $# > 0 )); do
+        >&2 echo -n "."					# show progress during search.
+
+        # Throw out any keys which are stop words, to reduce false hits.
+        if stop_word $key; then
+            shift
+            key="$1"
+            continue
+        fi
+
+        # Check for negate keys.
+        if [[ $key == -* ]]; then
+
+            # Locate indexes where hit(s) were found.
+            for filename in $files; do
+
+                # Count number of matches for negate key, sans the (-) prefix.
+                neg_hits=`grep -ic ${key:1} $filename`
+
+                if [[ $neg_hits -gt 0 ]]; then
+                    grep -Hin ${key:1} $filename | \
+                    awk -F ":" -v key=$key '
+                            { filename = $1;
+                              line = $2;
+                              printf("%s %06d %s\n", filename, line, key); }' | sort -r >> pass1.dat
+
+                    (( count += neg_hits ))
+                fi
+            done
+        fi
+
+        # Check for asterisks in key, and adjust grep search string accordingly.
+        search=$(asterisk $key)
+
+        # Locate indexes where hit(s) were found.
+        for filename in $files; do
+
+            # Count number of matches for current key.
+            hits=`grep -ic $search $filename`
+
+            if [[ $hits -gt 0 ]]; then
+                grep -Hin "$search" $filename | \
+                awk -F ":" -v key=$key '
+                        { filename = $1;
+                          line = $2;
+                          printf("%s %06d %s\n", filename, line, key); }' | sort -r >> pass1.dat
+            fi
+
+            (( count += hits ))
+        done
+
+        # Record valid keys for report header.
+        if [[ $count -gt 0 ]]; then
+            valid_keys="$valid_keys $key" 
+        fi
+
+        shift						# get next search key.
+        key=$1
+    done
+
+#exit -1
+
+    # Generate a list without any negate keys.
+    # pos_keys="`echo $valid_keys | sed 's/ /\n/g' | sed '/-/d'`"
+    pos_keys="`echo $valid_keys | sed '/-/d'`"
+
+    # Locate article boundries to determine which keys go together.
+    for filename in $files; do
+        grep -Hn '^--$' $filename | \
+        awk -F ":" '
+            { filename = $1;
+              line = $2;
+              printf("%s %06d --\n", filename, line) }' >> pass1.dat
+    done 
+
+#exit -1
+
+    # Merge all of the search results together.
+    sort -r -k1,1 -k2,2 pass1.dat > pass2.dat
+    cp pass2.dat pass1.dat
+
+#exit -1
+
+    >&2 echo -e "\nRemoving duplicate hits..."
+
+    # Collect key hits for each article, number of matching keys, and show which keys are missing.
+    # If any negate keys are found, remove article. 
+    # Remove the article boundries.
+    cat pass1.dat | awk -v keys="$pos_keys" '
+
+        BEGIN { hit = 0; neg = 0;
+                n = split(keys, master, " ") }
+
+        /--/  { if (hit == 1) { 
+
+                  # Count the number of key hits.
+                  count = 0;
+                  key_list ="";
+
+                  for (i=1; i <= n; i++)
+                    if (index(keys, master[i]) == 0)
+                      key_list = sprintf("%s %s", key_list, master[i]);
+                    else
+                      count++;
+
+                  if (neg == 0)
+                    printf("%d %s %6d%s\n", count, file, ndx, key_list); 
+
+                  hit = 0 }
+
+                neg = 0; }
+
+        !/--/ { if (substr($3, 1, 1) == "-")
+                  neg = 1;
+
+                if (hit == 1) {
+                  keys = sprintf("%s %s", keys, $3);
+                  ndx = $2; }
+
+                else {
+                  file = $1; ndx = $2; keys = $3; hit = 1; } }' > pass2.dat  
+
+#        END   { if (hit == 1)
+#                  # Count the number of key hits.
+#                  count = 0;
+#                  key_list ="";
+#
+#                  for (i=1; i <= n; i++)
+#                    if (index(keys, master[i]) == 0)
+#                      key_list = sprintf("%s %s", key_list, master[i]);
+#                    else
+#                      count++;
+#
+#                  printf("%d %s %6d%s\n", count, file, ndx, key_list); }' > pass2.dat
+
+    cp pass2.dat pass1.dat
+
+    >&2 echo -e "Sorting results..."
+    cat pass1.dat | sort -k1,1h -k2,2d -k3,3h | tail -r > pass2.dat
+
+    # Collect stats and generate summary.
+
+    files=`cat pass2.dat | awk '{ print $2 }' | sort | uniq | wc -l`
+    results=`cat pass2.dat | wc -l`
+
+    finish=$(date +"%s%N")
+    delta=`echo "scale=3; ($finish-$start)/1000000000" | bc`
+}
+
+# =================================================================================================
+#  Results algorithm and supporting functions.
+# =================================================================================================
+
+clearScreen ()
+{
+    # Automatically adjust output in width if terminal window changes. Do not do the same with
+    # rows, as this will either cause the program to exit prematurely or generate a subscript error.
+
+    clear
+
+    tagline="lookup - Quickly locate a process, notes, or event in the past."
+
+    col=$(( cols/2 - ${#tagline}/2 ))
+    if (( col < 0 )); then
+        col=0
+    fi
+
+    tput cup 1 $col                                     # Posiiton cursor on line 0.
+    printf "%s%s" $WHITE "$tagline"                     # Display centered tagline.
+    tput cup 4 0                                        # Position cursor on line 3.
+}
+
+# ------- --------- --------- --------- --------- --------- --------- --------- --------- ---------
+
+cleanupText ()
+
+# Cleanup query results prior to printing. Add commands as needed to this function.
+{
+    # Check for terminal window border changes.
+
+    cols=$(tput cols)                                   # Terminal session screen width.
+
+    # dos2unix conversion.
+    # Delete everything following task, ie. --.
+    # Delete everything following subtask, ie. ---
+    # Delete 1st line if blank.
+    # Supress multiple blank lines.
+    # Format text with current terminal frame.
+    # Limit search results within window to $content lines.
+    # Delete last blank line, to avoid double blank line at bottom of content.
+    # Required to avoid loosing last line of text.
+
+    sed 's///' | \
+    sed '/^--$/,$ d' | \
+    sed '/^---$/,$ d' | \
+    awk 'NF {p=1} p' | \
+    cat -s | \
+    # fmt -s -w $(( cols - 10 )) | \
+    head -$content
+}
+
+# ------- --------- --------- --------- --------- --------- --------- --------- --------- ---------
+
+orphanControl ()
+
+# Eliminate 1 line orphans from the search results content.
+
+{
+    awk '    { a[i++] = $0 } 
+
+         END { for (j=0; j<i-2; j++) 
+                   print a[j]; 
+
+               if (a[i-2] != "") 
+                   { print a[i-2]; 
+                     print a[i-1]} }'
+}
+
+# ------- --------- --------- --------- --------- --------- --------- --------- --------- ---------
+
+leftAlign ()
+
+# For any extracted content that had been indented, left align to the first non-space column, so that 
+# all results are uniform, to the same left margin for easier readability.
+
+{
+    awk 'BEGIN { min = 40; }
+
+         { a[i++] = $0;
+           len = length($0);
+
+           for (j=0; j<len; j++)
+              if (substr($0,j,1) != " ")
+                  break;
+
+           if ((j < min) && (length($0) > 0))
+               min = j; }
+
+         END { for (j=0; j<i; j++) {
+                   len = length(a[j]);
+                   print substr(a[j],min,len-min+1); } }'
+}
+
+# ------- --------- --------- --------- --------- --------- --------- --------- --------- ---------
+
+bulletAlign ()
+
+# Automatically wrap long text following a bullet or command prompt, so that the left alignment is 
+# not with the bullet, but with the text immediately following the bullet, for easier readibility.
+
+{
+    awk -v width=$1 '
+        BEGIN { spaces = "                    "; }
+
+        { # Reset line settings.
+
+          pos1 = 1; pos2 = 1; offset = 0; 
+          lineLength = length($0); 
+
+          # Look for bullet. If found, set indent length.
+
+          if ( $1 ~ /[A-Z]\./ ||
+               $1 ~ /[A-Z])/ ||
+               $1 ~ /[a-z]\./ ||
+               $1 ~ /[a-z])/ ||
+               $1 ~ /[0-9]\./ ||
+               $1 ~ /[0-9])/ ||
+               $1 ~ /\-/ ||
+               $1 ~ /\$/ ||
+               $1 ~ /\#/ )
+
+              indent = index($0, $1) + length($1);
+          else
+              indent = index($0, $1) - 1;
+
+        # Print the line with auto wrap and indent.
+
+        # Limit the indent value to prevent generating empty lines.
+
+        if (indent > width/2)
+            indent = 0;
+
+        do {
+            # Define the end position of the line segment.
+
+            segment = pos1 + width - offset;
+            pos2 = 0;
+
+# printf("%d %d %d %d %d\n", indent, segment, pos1, width, offset);
+
+            # Locate last space separator within segment,
+            # to determine segment bounderies as defined
+            # by pos1 to pos2.
+
+            if (segment < lineLength) {
+                for (pos = pos1 + 1; pos <= segment; pos++) 
+                    if (substr($0, pos, 1) == " " || substr($0, pos, 1) == "-")
+                        pos2 = pos; }
+            else
+                pos2 = lineLength;
+
+            # If no spaces were found, print whole segment.
+
+            if (pos2 == 0)
+                pos2 = segment;
+
+            # Add left indent for all lines created using
+            # word wrap following the initial line with 
+            # the bullet using offset variable.
+
+            printf "%s%s\n", substr(spaces,1,offset), substr($0, pos1, pos2 - pos1 + 1);
+
+# printf "----|----1----|----2----|----3----|----4----|----5----|----6----|----7-\n";
+# printf "%d,%d,%d\n", pos1, pos2, lineLength;
+
+            # Remove any leading spaces from beginning of
+            # next line to maintain left alightment.
+
+            pos1 = pos2;
+            while (substr($0, ++pos1, 1) == " ");
+
+            offset = indent;
+
+            } while (pos2 < lineLength)
+        }'
+}
+
+# ------- --------- --------- --------- --------- --------- --------- --------- --------- ---------
+
+progressBar ()
+
+# Display a progress bar along the bottom of the screen, showing the pages of results.
+
+{
+    (( min = (queryIndex / (matches * 10)) * 10 ))
+    (( max = ( ( (i * 10) / matches) + 8) / 10 - 1 ))
+    (( current = queryIndex / matches ))
+
+    if [ $(( max - min )) -gt 9 ]; then
+        (( max = min + 9 ))
+    fi
+
+    bar=$(printf "%s<%s " $BLUE $WHITE)
+
+    for (( page = min; page <= max ; page++ )); do
+        if [ $current -eq $page ]; then
+            bar=$(printf "%s %s%3s%s" "$bar" $YELLOW "$(( page + 1 ))" $WHITE)
+        else
+            bar=$(printf "%s %3s" "$bar" "$(( page + 1 ))")
+        fi
+
+        if [ $page -eq $max ]; then
+            bar=$(printf "%s%s   %s>%s" $WHITE "$bar" $BLUE $WHITE)
+            break
+        fi
+    done
+
+    (( row = rows - 2 ))
+    col=$(( cols/2 - ((page - (page - 1)/10*10) * 4 + 10)/2 ))
+
+    tput cup $row $col                                          # Move cursor to bottom of screen.
+
+    echo -n "$bar"
+}
+
+# ------- --------- --------- --------- --------- --------- --------- --------- --------- ---------
+
+normalExit ()
+
+# Normal exit from the script, resetting terminal colors and cursor position.
+
+{
+    # tput rmcup                                                # Restore terminal screen content.
+    tput cnorm                                                  # Reset cursor to normal state.
+    tput sgr0                                                   # Turn off all text effects.
+    exit 0
+}
+
+# ------- --------- --------- --------- --------- --------- --------- --------- --------- ---------
+
+resultsMenu ()
+
+# Display the query result, showing the Title (date from Daily Log), shortened filepath, position
+# within the file, and a short one paragraph excerpt.
+
+{
+    clearScreen
+
+    printf "  About %'.f results in %s files (%0.3f seconds).\n" $results $files $delta
+    printf "  Showing results for %s\n\n\n" "${valid_keys:1}" 
+
+    for (( k=0; k!=matches && (j+k)<i; k++ )); do
+
+        (( menuNumber = k + 1 ))
+        (( queryIndex = j + k ))
+
+        # Locate the date of the entry, scrolling back to the last date entry.
+
+        day=`head -${indexes[queryIndex]} "$path/${filenames[queryIndex]}" | \
+             grep -E "^Mon,|^Tue,|^Wed,|^Thu,|^Thr,|^Fri,|^Sat,|^Sun," | tail -1`
+
+        printf "  %s%s. %s%s\n" $BLUE "$menuNumber" "$day" $NORM
+        printf "     %s%s.../%s, line=%s%s\n\n" $GREEN "$basePath" \
+               "${filenames[queryIndex]}" \
+               "${indexes[queryIndex]}" $NORM
+
+        # Extract $content lines from file, starting at queryIndex.
+
+        (( end = ${indexes[queryIndex]} + $content - 1 ))
+
+        # After cleanup, orphan control, and alignment, then indent and remove trailing blank lines.
+
+        printf "%s" $WHITE
+        head -$end "$path/${filenames[queryIndex]}" | tail -$content | \
+            leftAlign | \
+            bulletAlign $(( cols - 16 )) | \
+            head -$content | \
+            cleanupText | \
+            orphanControl | \
+            sed '1,$s/^/        /' | \
+            sed '$ {/^[[:space:]]*$/d;}' 
+
+        if (( ${#misses[queryIndex]} > 0 )); then
+            printf "        %sMissing: %s%s\n" $YELLOW "${misses[queryIndex]}" $WHITE
+        fi
+
+        echo
+        echo
+    done
+
+    progressBar
+}
+
+# ------- --------- --------- --------- --------- --------- --------- --------- --------- ---------
+
+Results ()
+{
+    i=0					# monitor number of hit records.
+
+    # Read search results to arrays for quick access.
+
+    while read null filenames[$i] indexes[$i] misses[$i]; do
+        (( i++ ))
+    done < pass2.dat
+
+    # Main report loop, used to quickly preview search hits via a simple menu.
+
+    for (( j=0; j<i; j+=matches )); do
+        resultsMenu
+
+        while read -rsn1 keypress; do
+
+            # Check for terminal window border changes.
+
+            cols=$(tput cols)                               # Terminal session screen width.
+
+            # If the screen rows have changed, restart the main report loop.
+
+            if (( rows != $(tput lines) || cols != $(tput cols) )); then
+                rows=$(tput lines)		  	    # Terminal session screen height.
+                matches=$(( (rows - 8 ) / (6 + content) ))  # Calculate how many results will fit.
+                j=0
+                resultsMenu
+            fi
+ 
+            case "$keypress" in
+                $'\x1b' )    		# process ESC sequence.
+                    read -rsn1 tmp
+                    if [[ "$tmp" == "[" ]]; then
+                        read -rsn1 tmp
+
+                        case "$tmp" in
+                            5 ) # PgUp
+                                continue;;
+
+                            6 ) # PgDn
+                                continue;;
+
+                            A ) # Up
+                                continue;;
+
+                            B ) # Down
+                                continue;;
+
+                            C ) # Right
+                                if (( j <= ( i - matches - 1) )); then
+                                    break
+                                fi;;
+
+                            D ) # Left
+                                if (( j > 0 )); then
+                                    (( j -= $matches ))
+                                    resultsMenu
+                                    continue
+                                fi;;
+                        esac
+                    fi
+   
+                    # Flush "stdin" with 0.1 sec timeout.
+                    read -rsn5;;
+
+               # Other one byte (char) cases.
+
+                [123456789] ) # Menu Selection
+                    if (( keypress <= k )); then
+                        itemIndex=$(( j + keypress - 1 ))
+
+                        # Display the entire article/node surrounding the matched text, 
+                        # to include context and/or relevant notes.
+
+                        pos=`head -${indexes[$itemIndex]} ${filenames[$itemIndex]} | \
+                            grep -n '^--$' | tail -1 | sed 's/:.*//'`
+
+                        # Generate new lineBreak string, matching the terminal width.
+
+                        lineBreak=""
+                        for (( k = 1; k < cols/3; k++ )); do
+                            lineBreak="-- $lineBreak"
+                        done
+
+                        # Added so left and right terminal borders match.
+                        (( newcols = cols - 2 ))
+
+                        # Generate pattern for less to highlight search keys.
+                        pattern=`echo $valid_keys | sed 's/ /|/g'`
+
+                        tail -n +$(( $pos + 1 )) ${filenames[$itemIndex]} |\
+                            sed "s/-- -- --/$lineBreak/" | \
+                            awk '/^--[ ]*$/ {exit} {print}' | \
+                            bulletAlign $(( cols - 4 )) | \
+                            sed 's/^/  /' | \
+                            sed '1s/^/'$WHITE'/' | \
+                            less -cir -p $pattern 
+               
+                        resultsMenu
+                    fi
+                    continue;;
+
+                $'\x0' ) # Next
+                    if (( j <= ( i - matches - 1) )); then
+                        break
+                    fi;;
+
+                b ) # Prev
+                    if (( j > 0 )); then
+                        (( j -= $matches ))
+                        resultsMenu
+                        continue
+                    fi;;
+
+                q ) # Quit
+                    tput cup $rows 0				# Move cursor to bottom of screen.
+                    normalExit;;
+            esac
+        done
+    done
+}
+
+# =================================================================================================
+#  Script begins here.
+# =================================================================================================
+
+if (( $# == 0 )); then
+    usage_error
+    exit 1
+fi
+
+Search "$@"
+Results
+
+# Init
+
+# Search_Archives
+#   Define_Scope
+#   Init_Pass
+#   Next_Pass
+
+# Display_Results
+#   Screen_Header
+#   Results_Page
+#   Navigation_Footer
+#   User_Input
+#   Display_Detail
+
